@@ -47,7 +47,7 @@ SEARCH_BOT = _require("SEARCH_BOT")
 
 QUERY_TEMPLATE         = os.getenv("QUERY_TEMPLATE",             "{series} S{season:02d}E{episode:02d}")
 DOWNLOAD_DIR           = Path(os.getenv("DOWNLOAD_DIR",          "./downloads"))
-RESPONSE_TIMEOUT       = int(os.getenv("RESPONSE_TIMEOUT",       "60"))
+RESPONSE_TIMEOUT       = int(os.getenv("RESPONSE_TIMEOUT",       "15"))
 DELAY_BETWEEN_EPISODES = int(os.getenv("DELAY_BETWEEN_EPISODES", "8"))
 MAX_CONSECUTIVE_FAILS  = 2
 MAX_EPISODES_CAP       = 60
@@ -270,91 +270,98 @@ class EpisodeDownloader:
         `confirmed` is True if the bot's file message arrived after
         the click, or False if it timed out.
         """
-        file_buttons = []     # list of (label_text, button) — file results
+        # Collected entries: (label, msg_id, callback_data)
+        # We store the raw callback data instead of the button object so we
+        # can re-fetch a *fresh* button reference right before clicking —
+        # stale button objects cause DataInvalidError after time passes.
+        file_entries = []   # list of (label, msg_id, callback_data)
         MAX_PAGES = 10
 
         NEXT_WORDS = ("NEXT", "➡", "→", "▶")
 
         def _is_next_button(label: str) -> bool:
-            up = label.upper()
-            return any(w in up for w in NEXT_WORDS)
+            return any(w in label.upper() for w in NEXT_WORDS)
 
-        async def _collect_page():
-            """Wait for the bot's next results message, split its
-            callback buttons into file buttons vs a NEXT button."""
-            page_file_buttons = []
-            next_button = [None]
-            got_results = asyncio.Event()
+        async def _collect_page(after_id: int, edit_msg_id: int | None = None):
+            """Wait for the bot's next results page for this query.
 
-            @self.client.on(events.NewMessage(from_users=SEARCH_BOT))
-            async def page_handler(event):
-                msg = event.message
+            The page may arrive either as a brand-new message (id >
+            after_id) or — for bots that paginate by editing the
+            existing results message in place — as an edit to the
+            message identified by edit_msg_id. Returns
+            (page_entries, next_info) for that page."""
+            page_entries  = []          # (label, msg_id, cb_data)
+            next_info     = [None]      # (msg_id, cb_data) for the Next btn
+            got_results   = asyncio.Event()
 
+            def _process(msg):
                 if msg.media and isinstance(msg.media, MessageMediaDocument):
-                    return  # not expected here, ignore
+                    return  # file delivery — ignore here
 
                 if not msg.buttons:
                     if msg.text:
                         snippet = msg.text[:200].replace("\n", " | ")
                         log.info(f"  Bot said: {snippet}")
-                        # The bot's definitive "nothing matched this
-                        # query" reply — stop waiting immediately
-                        # instead of timing out.
                         if "no results" in msg.text.lower():
                             got_results.set()
                     return
 
+                found_file_btn = False
                 for row in msg.buttons:
                     for btn in row:
-                        raw = getattr(btn, "button", btn)
-                        label = (getattr(btn, "text", "") or "")
+                        raw   = getattr(btn, "button", btn)
+                        label = getattr(btn, "text", "") or ""
                         if not isinstance(raw, KeyboardButtonCallback):
                             continue
+                        cb_data = raw.data
                         if _is_next_button(label):
-                            next_button[0] = btn
+                            next_info[0] = (msg.id, cb_data)
                         else:
-                            page_file_buttons.append((label, btn))
+                            page_entries.append((label, msg.id, cb_data))
+                            found_file_btn = True
 
-                got_results.set()
+                # Only signal done if this message actually had file buttons
+                # (avoids triggering on the bot's header/intro text messages)
+                if found_file_btn or next_info[0]:
+                    got_results.set()
+
+            @self.client.on(events.NewMessage(from_users=SEARCH_BOT))
+            async def page_handler(event):
+                msg = event.message
+                # Ignore messages that arrived before we sent the query
+                if msg.id <= after_id:
+                    return
+                _process(msg)
+
+            @self.client.on(events.MessageEdited(from_users=SEARCH_BOT))
+            async def edit_handler(event):
+                msg = event.message
+                # Some bots paginate by editing the results message in
+                # place rather than sending a new one — only react to
+                # edits of the specific message we're waiting on.
+                if edit_msg_id is None or msg.id != edit_msg_id:
+                    return
+                _process(msg)
 
             try:
                 await asyncio.wait_for(got_results.wait(), timeout=RESPONSE_TIMEOUT)
             except asyncio.TimeoutError:
-                log.warning(f"  ⏱  Timed out — no results received")
+                log.warning("  ⏱  Timed out — no results received")
             finally:
                 self.client.remove_event_handler(page_handler)
+                self.client.remove_event_handler(edit_handler)
 
-            return page_file_buttons, next_button[0]
+            return page_entries, next_info[0]
 
-        # ── Send query and collect first page ──
-        await self.client.send_message(SEARCH_BOT, query)
-        log.info(f"  ↗  Query sent: «{query}»")
+        async def _fresh_click(msg_id: int, cb_data: bytes):
+            """Trigger the callback button directly via the Bot API
+            (GetBotCallbackAnswerRequest) instead of re-fetching the
+            message and clicking a button object. This works whether
+            or not the target message has since been edited (e.g. by
+            pagination) — we only need the message id and the button's
+            callback data, both of which we already collected.
 
-        page_buttons, next_btn = await _collect_page()
-        file_buttons.extend(page_buttons)
-
-        # ── Follow NEXT pages, if the bot offers any ──
-        pages_seen = 1
-        while next_btn is not None and pages_seen < MAX_PAGES:
-            log.info(f"  📄  Loading next page …")
-            await asyncio.sleep(1)
-            await next_btn.click()
-            page_buttons, next_btn = await _collect_page()
-            if not page_buttons and next_btn is None:
-                break
-            file_buttons.extend(page_buttons)
-            pages_seen += 1
-
-        if not file_buttons:
-            return []
-
-        log.info(f"  📋  Found {len(file_buttons)} file button(s) for this query")
-
-        # ── Click each file button immediately (fresh) and confirm ──
-        results = []
-        for label, btn in file_buttons:
-            display_name, size = self._parse_label(label)
-
+            Returns (got_doc: bool, doc_msg | None)."""
             doc_event  = asyncio.Event()
             doc_holder = [None]
 
@@ -366,24 +373,113 @@ class EpisodeDownloader:
                     doc_event.set()
 
             try:
-                await btn.click()
+                answer = await self.client(functions.messages.GetBotCallbackAnswerRequest(
+                    peer=bot_peer,
+                    msg_id=msg_id,
+                    data=cb_data,
+                ))
+                if getattr(answer, "message", None):
+                    log.info(f"  💬  Bot says: {answer.message}")
                 await asyncio.wait_for(doc_event.wait(), timeout=RESPONSE_TIMEOUT)
-                confirmed = doc_holder[0] is not None
             except asyncio.TimeoutError:
-                confirmed = False
+                pass
+            except Exception as e:
+                log.warning(f"  ⚠️  Callback click failed: {e}")
             finally:
                 self.client.remove_event_handler(doc_handler)
 
-            if confirmed:
-                fname = self._filename_from_msg(doc_holder[0])
-                log.info(f"  ✓  Sent to chat: {fname}  ({size})")
+            return doc_holder[0] is not None, doc_holder[0]
+
+        # Resolve the bot once so _fresh_click / the Next-page click below
+        # can call GetBotCallbackAnswerRequest directly, without needing a
+        # live button object.
+        bot_peer = await self.client.get_input_entity(SEARCH_BOT)
+
+        # ── Click results as we go, not at the end ───────────────────
+        # This bot edits ONE message in place across pages, so once we
+        # paginate past a page, Telegram no longer considers that
+        # page's button data valid for THIS message id — clicking it
+        # later raises DataInvalidError ("Encrypted data invalid").
+        # So instead of collecting every page and picking a global
+        # "best" afterwards, we click the best result seen so far
+        # immediately, while its page is still the message's current
+        # state. A later page only triggers another click if it's a
+        # genuine quality upgrade over what's already been sent.
+        results_sent = []       # (label, confirmed) for every file clicked
+        best_seen     = [None]  # best (label, msg_id, cb_data) clicked so far
+
+        async def _maybe_click_best(page_entries):
+            if not page_entries:
+                return
+            page_best = max(page_entries, key=lambda e: quality_score(e[0]))
+            if (best_seen[0] is not None
+                    and quality_score(page_best[0]) <= quality_score(best_seen[0][0])):
+                return  # not an improvement — leave the earlier click as-is
+
+            best_seen[0] = page_best
+            label, msg_id, cb = page_best
+            chosen_display, chosen_size = self._parse_label(label)
+            log.info(f"  🏆  Best so far: {chosen_display}  ({chosen_size})")
+
+            result = await _fresh_click(msg_id, cb)
+            confirmed, doc_msg = result if isinstance(result, tuple) else (result, None)
+            if confirmed and doc_msg:
+                fname = self._filename_from_msg(doc_msg)
+                log.info(f"  ✓  Sent to chat: {fname}  ({chosen_size})")
             else:
-                log.warning(f"  ⚠️  No file arrived for: {display_name}")
+                log.warning(f"  ⚠️  No file arrived for: {chosen_display}")
+            results_sent.append((label, confirmed))
 
-            results.append((label, confirmed))
-            await asyncio.sleep(1)  # be polite between clicks
+        # ── Send query and paginate, collecting all entries ──────────
+        # Grab the latest message ID before sending so we can ignore
+        # anything older (stale messages from prior searches).
+        watermark_msg = await self.client.get_messages(SEARCH_BOT, limit=1)
+        watermark_id  = watermark_msg[0].id if watermark_msg else 0
 
-        return results
+        await self.client.send_message(SEARCH_BOT, query)
+        log.info(f"  ↗  Query sent: «{query}»")
+
+        page_entries, next_info = await _collect_page(watermark_id)
+        file_entries.extend(page_entries)
+        await _maybe_click_best(page_entries)
+
+        pages_seen = 1
+        while next_info is not None and pages_seen < MAX_PAGES:
+            log.info(f"  📄  Loading next page …")
+            await asyncio.sleep(1)
+            next_msg_id, next_cb = next_info
+
+            # Watermark before triggering Next, in case the bot sends a
+            # brand-new message for this page rather than editing the
+            # existing one. (An in-place edit is matched separately via
+            # edit_msg_id below, regardless of this watermark.)
+            watermark_msg = await self.client.get_messages(SEARCH_BOT, limit=1)
+            watermark_id  = watermark_msg[0].id if watermark_msg else next_msg_id
+
+            try:
+                answer = await self.client(functions.messages.GetBotCallbackAnswerRequest(
+                    peer=bot_peer,
+                    msg_id=next_msg_id,
+                    data=next_cb,
+                ))
+                if getattr(answer, "message", None):
+                    log.info(f"  💬  Bot says: {answer.message}")
+            except Exception as e:
+                log.warning(f"  ⚠️  Could not load next page: {e}")
+                break
+
+            page_entries, next_info = await _collect_page(watermark_id, edit_msg_id=next_msg_id)
+            if not page_entries and next_info is None:
+                break
+            file_entries.extend(page_entries)
+            await _maybe_click_best(page_entries)
+            pages_seen += 1
+
+        if not file_entries:
+            return []
+
+        log.info(f"  📋  Found {len(file_entries)} result(s) across {pages_seen} page(s)")
+        return results_sent
 
     # ── Label parsing / display helpers ───────────────────────────
 
