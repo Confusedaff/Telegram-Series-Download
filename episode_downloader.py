@@ -24,6 +24,7 @@ from telethon.tl.types import (
     MessageMediaDocument,
     DocumentAttributeFilename,
     KeyboardButtonUrl,
+    KeyboardButtonCallback,
 )
 
 # ═══════════════════════════════════════════════════════════════════
@@ -243,81 +244,133 @@ class EpisodeDownloader:
 
     async def browse_bot(self, query: str) -> list:
         """
-        Send *query*, then collect ALL result messages the bot sends
+        Send *query*, then collect ALL result buttons the bot offers
         (including across NEXT pagination buttons).
 
-        Returns a flat list of Telethon Message objects that carry
-        a document (i.e. actual downloadable files).
+        The bot's protocol for this query type is:
+          1. It sends ONE "🔍 Results for your Search." message whose
+             buttons are KeyboardButtonCallback entries — the button
+             TEXT is the filename/size (e.g. "[1.40 GB] [S02E01] ...")
+             and the button DATA is an opaque "pmfile#..." token.
+          2. Clicking such a button makes the bot answer with
+             "Sending file..." and then send a NEW message in this
+             same chat containing the actual MessageMediaDocument.
+          3. If there are multiple results, additional pages may be
+             reached via a "Next ➡️" style callback button.
+
+        IMPORTANT: this method does NOT click the file buttons (that
+        would make the bot transfer every candidate file just to
+        build a picker list). It only collects the (label, button)
+        pairs so the caller can show a numbered list. The actual
+        click — which triggers the bot to send the real file — only
+        happens later, in `_download_msg`, for the items the user
+        selects.
+
+        Returns a flat list of (label_text, button) tuples.
         """
-        results    = []       # list of Message objects with documents
-        text_msgs  = []       # text/status messages (for display)
-        done       = asyncio.Event()
-        paginating = [False]
+        file_buttons = []     # list of (label_text, button) — file results
+        MAX_PAGES = 10
 
-        @self.client.on(events.NewMessage(from_users=SEARCH_BOT))
-        async def collect_handler(event):
-            msg = event.message
+        NEXT_WORDS = ("NEXT", "➡", "→", "▶")
 
-            # ── Got a file result ──
-            if msg.media and isinstance(msg.media, MessageMediaDocument):
-                results.append(msg)
-                return
+        def _is_next_button(label: str) -> bool:
+            up = label.upper()
+            return any(w in up for w in NEXT_WORDS)
 
-            # ── Got a text message (status or search results list) ──
-            if msg.text:
-                text_msgs.append(msg.text)
+        async def _collect_page():
+            """Wait for the bot's next results message, split its
+            callback buttons into file buttons vs a NEXT button."""
+            page_file_buttons = []
+            next_button = [None]
+            got_results = asyncio.Event()
 
-            # ── Check buttons: NEXT pagination or end-of-results ──
-            if msg.buttons:
-                next_btn = None
+            @self.client.on(events.NewMessage(from_users=SEARCH_BOT))
+            async def page_handler(event):
+                msg = event.message
+
+                if msg.media and isinstance(msg.media, MessageMediaDocument):
+                    return  # not expected here, ignore
+
+                if not msg.buttons:
+                    if msg.text:
+                        snippet = msg.text[:200].replace("\n", " | ")
+                        log.info(f"  Bot said: {snippet}")
+                    return
+
                 for row in msg.buttons:
                     for btn in row:
-                        label = (getattr(btn, "text", "") or "").upper()
-                        if "NEXT" in label or "➡" in label or "→" in label:
-                            next_btn = btn
-                            break
-                    if next_btn:
-                        break
+                        raw = getattr(btn, "button", btn)
+                        label = (getattr(btn, "text", "") or "")
+                        if not isinstance(raw, KeyboardButtonCallback):
+                            continue
+                        if _is_next_button(label):
+                            next_button[0] = btn
+                        else:
+                            page_file_buttons.append((label, btn))
 
-                if next_btn:
-                    # More pages — click NEXT and keep collecting
-                    paginating[0] = True
-                    log.info(f"  📄  Loading next page …")
-                    await asyncio.sleep(1)
-                    await next_btn.click()
-                    return
-                else:
-                    # Buttons exist but no NEXT → this is the last page
-                    done.set()
-            else:
-                # No buttons at all → end of results
-                if not paginating[0]:
-                    # Small delay in case more messages are still incoming
-                    await asyncio.sleep(2)
-                    done.set()
+                got_results.set()
 
-        try:
-            await self.client.send_message(SEARCH_BOT, query)
-            log.info(f"  ↗  Query sent: «{query}»")
-            await asyncio.wait_for(done.wait(), timeout=RESPONSE_TIMEOUT)
-        except asyncio.TimeoutError:
-            if not results:
+            try:
+                await asyncio.wait_for(got_results.wait(), timeout=RESPONSE_TIMEOUT)
+            except asyncio.TimeoutError:
                 log.warning(f"  ⏱  Timed out — no results received")
-        finally:
-            self.client.remove_event_handler(collect_handler)
+            finally:
+                self.client.remove_event_handler(page_handler)
 
-        # If the bot sent text results (filenames listed as text, not files),
-        # log them so the user can see what the bot said
-        for t in text_msgs:
-            snippet = t[:200].replace("\n", " | ")
-            log.info(f"  Bot said: {snippet}")
+            return page_file_buttons, next_button[0]
 
-        return results
+        # ── Send query and collect first page ──
+        await self.client.send_message(SEARCH_BOT, query)
+        log.info(f"  ↗  Query sent: «{query}»")
+
+        page_buttons, next_btn = await _collect_page()
+        file_buttons.extend(page_buttons)
+
+        # ── Follow NEXT pages, if the bot offers any ──
+        pages_seen = 1
+        while next_btn is not None and pages_seen < MAX_PAGES:
+            log.info(f"  📄  Loading next page …")
+            await asyncio.sleep(1)
+            await next_btn.click()
+            page_buttons, next_btn = await _collect_page()
+            if not page_buttons and next_btn is None:
+                break
+            file_buttons.extend(page_buttons)
+            pages_seen += 1
+
+        if file_buttons:
+            log.info(f"  📋  Found {len(file_buttons)} file button(s) for this query")
+
+        return file_buttons
 
     # ── Show results and let user pick ───────────────────────────
 
+    _LABEL_PATTERN = re.compile(
+        r'^\[(?P<size>[^\]]+)\]\s*(?:\[(?P<tag>[^\]]+)\])?\s*(?P<name>.+)$'
+    )
+
+    def _parse_label(self, label: str) -> tuple[str, str]:
+        """
+        Parse a result-button label like
+          "[1.40 GB] [S02E01] Psych 2006 American Duos 1080p WEB DL x265 MONOLITH"
+        into (display_name, size_str).
+
+        Falls back gracefully if the label doesn't match the expected
+        "[size] [tag] name" shape.
+        """
+        m = self._LABEL_PATTERN.match(label.strip())
+        if not m:
+            return label.strip(), "?"
+
+        size = m.group("size").strip()
+        tag  = m.group("tag")
+        name = m.group("name").strip()
+        if tag:
+            name = f"[{tag}] {name}"
+        return name, size
+
     def _filename_from_msg(self, msg) -> str:
-        """Extract the best display name from a message."""
+        """Extract the best display name from a downloaded document message."""
         if msg.media and isinstance(msg.media, MessageMediaDocument):
             for attr in msg.media.document.attributes:
                 if isinstance(attr, DocumentAttributeFilename):
@@ -352,25 +405,25 @@ class EpisodeDownloader:
         limit = MAX_EPISODES_CAP if auto else (to_ep - from_ep + 1)
 
         print(f"\n{'═'*58}")
-        print(f"  🎬  {series}  {'('+str(auto) and 'AUTO' or ''}")
+        print(f"  🎬  {series}")
         print(f"  📅  Season {season}  ·  Episodes {from_ep} → {'AUTO' if auto else to_ep}")
         print(f"{'═'*58}\n")
 
-        all_results  = []   # (episode_number, message)
+        all_results  = []   # (episode_number, label, button)
         consec_fails = 0
 
         for ep in range(from_ep, from_ep + limit):
-            ep_str = f"S{season:02d}E{episode:02d}" if False else f"S{season:02d}E{ep:02d}"
+            ep_str = f"S{season:02d}E{ep:02d}"
             query  = QUERY_TEMPLATE.format(
                 series=search_term, season=season, episode=ep
             )
             print(f"  🔍  Searching {ep_str} …")
-            msgs = await self.browse_bot(query)
+            buttons = await self.browse_bot(query)
 
-            if msgs:
+            if buttons:
                 consec_fails = 0
-                for m in msgs:
-                    all_results.append((ep, m))
+                for label, btn in buttons:
+                    all_results.append((ep, label, btn))
             else:
                 consec_fails += 1
                 print(f"  ✗  Nothing found for {ep_str}")
@@ -389,9 +442,8 @@ class EpisodeDownloader:
         # ── Display the numbered list ──────────────────────────────
         print(f"\n{'─'*58}")
         print(f"  📋  Found {len(all_results)} file(s):\n")
-        for i, (ep, msg) in enumerate(all_results, 1):
-            fname = self._filename_from_msg(msg)
-            fsize = self._filesize_from_msg(msg)
+        for i, (ep, label, _btn) in enumerate(all_results, 1):
+            fname, fsize = self._parse_label(label)
             ep_str = f"S{season:02d}E{ep:02d}"
             print(f"  [{i:>2}]  {ep_str}  {fname}  ({fsize})")
         print(f"{'─'*58}")
@@ -413,8 +465,8 @@ class EpisodeDownloader:
         # ── Download chosen files ──────────────────────────────────
         print(f"\n  ⬇  Downloading {len(selected)} file(s) …\n")
         for idx in selected:
-            ep, msg = all_results[idx - 1]
-            await self._download_msg(msg, series, season, ep)
+            ep, label, btn = all_results[idx - 1]
+            await self._download_msg(btn, label, series, season, ep)
             if idx != selected[-1]:
                 await asyncio.sleep(3)
 
@@ -442,8 +494,43 @@ class EpisodeDownloader:
             print(f"  ⚠️  Ignored out-of-range: {invalid}")
         return valid
 
-    async def _download_msg(self, msg, series: str, season: int, episode: int):
-        ep_str   = f"S{season:02d}E{episode:02d}"
+    async def _download_msg(self, btn, label: str, series: str, season: int, episode: int):
+        """
+        Click a result button, wait for the bot to send the actual
+        file as a follow-up message, then download it.
+
+        `btn` is the KeyboardButtonCallback whose .text is `label`
+        (e.g. "[1.40 GB] [S02E01] Psych 2006 American Duos 1080p WEB DL x265 MONOLITH").
+        """
+        ep_str = f"S{season:02d}E{episode:02d}"
+        display_name, _size = self._parse_label(label)
+
+        # ── Click the button, wait for the bot to send the document ──
+        doc_event  = asyncio.Event()
+        doc_holder = [None]
+
+        @self.client.on(events.NewMessage(from_users=SEARCH_BOT))
+        async def doc_handler(event):
+            m = event.message
+            if m.media and isinstance(m.media, MessageMediaDocument):
+                doc_holder[0] = m
+                doc_event.set()
+
+        try:
+            print(f"  ▶  {ep_str}  requesting: {display_name}")
+            await btn.click()
+            await asyncio.wait_for(doc_event.wait(), timeout=RESPONSE_TIMEOUT)
+        except asyncio.TimeoutError:
+            print(f"  ⏱  {ep_str}  timed out waiting for the bot to send the file")
+            return
+        finally:
+            self.client.remove_event_handler(doc_handler)
+
+        msg = doc_holder[0]
+        if msg is None:
+            print(f"  ⚠️  {ep_str}  bot did not send a file")
+            return
+
         filename = self._filename_from_msg(msg)
 
         safe_name = series.replace(" ", "_").replace("/", "-")
