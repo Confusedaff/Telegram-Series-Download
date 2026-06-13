@@ -295,6 +295,11 @@ class EpisodeDownloader:
                     if msg.text:
                         snippet = msg.text[:200].replace("\n", " | ")
                         log.info(f"  Bot said: {snippet}")
+                        # The bot's definitive "nothing matched this
+                        # query" reply — stop waiting immediately
+                        # instead of timing out.
+                        if "no results" in msg.text.lower():
+                            got_results.set()
                     return
 
                 for row in msg.buttons:
@@ -409,7 +414,7 @@ class EpisodeDownloader:
         print(f"  📅  Season {season}  ·  Episodes {from_ep} → {'AUTO' if auto else to_ep}")
         print(f"{'═'*58}\n")
 
-        all_results  = []   # (episode_number, label, button)
+        all_results  = []   # (episode_number, query, label)
         consec_fails = 0
 
         for ep in range(from_ep, from_ep + limit):
@@ -422,8 +427,8 @@ class EpisodeDownloader:
 
             if buttons:
                 consec_fails = 0
-                for label, btn in buttons:
-                    all_results.append((ep, label, btn))
+                for label, _btn in buttons:
+                    all_results.append((ep, query, label))
             else:
                 consec_fails += 1
                 print(f"  ✗  Nothing found for {ep_str}")
@@ -442,7 +447,7 @@ class EpisodeDownloader:
         # ── Display the numbered list ──────────────────────────────
         print(f"\n{'─'*58}")
         print(f"  📋  Found {len(all_results)} file(s):\n")
-        for i, (ep, label, _btn) in enumerate(all_results, 1):
+        for i, (ep, _query, label) in enumerate(all_results, 1):
             fname, fsize = self._parse_label(label)
             ep_str = f"S{season:02d}E{ep:02d}"
             print(f"  [{i:>2}]  {ep_str}  {fname}  ({fsize})")
@@ -463,14 +468,56 @@ class EpisodeDownloader:
             return
 
         # ── Download chosen files ──────────────────────────────────
+        # NOTE: the buttons collected during the search pass above can
+        # go stale by the time the user picks (the bot's results
+        # message may be deleted/expire after a few minutes — clicking
+        # an old button raises MessageIdInvalidError). So for each
+        # selected item we re-send its query to get a FRESH results
+        # message, then click immediately.
         print(f"\n  ⬇  Downloading {len(selected)} file(s) …\n")
         for idx in selected:
-            ep, label, btn = all_results[idx - 1]
-            await self._download_msg(btn, label, series, season, ep)
+            ep, query, label = all_results[idx - 1]
+            ep_str = f"S{season:02d}E{ep:02d}"
+            print(f"  🔄  {ep_str}  refreshing search before download …")
+            fresh_buttons = await self.browse_bot(query)
+            fresh_btn = self._match_button(fresh_buttons, label)
+            if fresh_btn is None:
+                print(f"  ⚠️  {ep_str}  couldn't re-find this result — skipping")
+                continue
+            await self._download_msg(fresh_btn, label, series, season, ep)
             if idx != selected[-1]:
                 await asyncio.sleep(3)
 
         print(f"\n  ✅  Done. Files saved to: {DOWNLOAD_DIR.resolve()}\n")
+
+    def _match_button(self, fresh_buttons, label: str):
+        """
+        Given a fresh list of (label, button) pairs from a re-search,
+        find the button matching `label` (the one shown to the user
+        in the numbered list).
+
+        Tries an exact match first, then falls back to matching on
+        the parsed display-name (in case sizes/whitespace shift
+        slightly between searches), then finally falls back to the
+        first available button if there's exactly one candidate.
+        """
+        if not fresh_buttons:
+            return None
+
+        for fresh_label, btn in fresh_buttons:
+            if fresh_label == label:
+                return btn
+
+        target_name, _ = self._parse_label(label)
+        for fresh_label, btn in fresh_buttons:
+            fresh_name, _ = self._parse_label(fresh_label)
+            if fresh_name == target_name:
+                return btn
+
+        if len(fresh_buttons) == 1:
+            return fresh_buttons[0][1]
+
+        return None
 
     def _parse_selection(self, raw: str, max_n: int) -> list[int]:
         """Parse '1 2 3', '1-5', 'all' into a sorted list of 1-based indices."""
