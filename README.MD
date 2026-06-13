@@ -7,7 +7,7 @@ A command-line tool built on [Telethon](https://docs.telethon.dev/) that automat
 ## Screenshots
 
 <!-- Replace with a screenshot of the help banner / startup output -->
-![Startup banner](screenshots/01-startup.png)
+![Startup banner](<img width="1776" height="684" alt="Image" src="https://github.com/user-attachments/assets/a33b3410-4bf2-4643-8d4f-d8811a014761" />)
 
 ## Features
 
@@ -195,7 +195,7 @@ python episode_downloader.py
 On first run, Telethon will ask for your phone number and login code, then save a session file (`ep_dl_session.session`) so future runs don't require logging in again.
 
 <!-- Replace with a screenshot of the channel auto-join log output -->
-![Channel auto-join log](screenshots/02-channel-join.png)
+![Channel auto-join log](<img width="1794" height="64" alt="Image" src="https://github.com/user-attachments/assets/571fc5a5-06df-467e-ae2b-6302ef281cec" />)
 
 You'll then see a help banner followed by:
 
@@ -261,7 +261,7 @@ After parsing, the script confirms what it understood before searching:
 ```
 
 <!-- Replace with a screenshot of the input prompt and confirmation -->
-![Input prompt and confirmation](screenshots/03-input-confirm.png)
+![Input prompt and confirmation](<img width="1312" height="266" alt="Image" src="https://github.com/user-attachments/assets/f1cc3a0a-c328-4e77-bee9-225fd059c0ac" />)
 
 Type `quit`, `q`, or `exit` at the first prompt to exit without searching.
 
@@ -270,7 +270,7 @@ Type `quit`, `q`, or `exit` at the first prompt to exit without searching.
 For each matching result, the script clicks the bot's button — the bot then posts the file as a message in your chat with it.
 
 <!-- Replace with a screenshot of the bot delivering files in Telegram -->
-![Bot delivering files in Telegram](screenshots/04-telegram-delivery.png)
+![Bot delivering files in Telegram](<img width="1148" height="914" alt="Image" src="https://github.com/user-attachments/assets/143ab076-00c5-4d40-8c98-a1da26a2f9c9" />)
 
 Open Telegram afterward and download each file from that chat as usual.
 
@@ -284,7 +284,7 @@ Open Telegram afterward and download each file from that chat as usual.
 ```
 
 <!-- Replace with a screenshot of the final summary in the terminal -->
-![Run summary](screenshots/05-summary.png)
+![Run summary](<img width="1410" height="210" alt="Image" src="https://github.com/user-attachments/assets/f67ac3b7-168b-466f-86bd-71f74188654d" />)
 
 ## Limitations & Notes
 
