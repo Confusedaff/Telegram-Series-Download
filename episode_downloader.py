@@ -244,8 +244,9 @@ class EpisodeDownloader:
 
     async def browse_bot(self, query: str) -> list:
         """
-        Send *query*, then collect ALL result buttons the bot offers
-        (including across NEXT pagination buttons).
+        Send *query*, then for EVERY result button the bot offers
+        (including across NEXT pagination buttons), click it so the
+        bot delivers the actual file message into this chat.
 
         The bot's protocol for this query type is:
           1. It sends ONE "🔍 Results for your Search." message whose
@@ -254,19 +255,20 @@ class EpisodeDownloader:
              and the button DATA is an opaque "pmfile#..." token.
           2. Clicking such a button makes the bot answer with
              "Sending file..." and then send a NEW message in this
-             same chat containing the actual MessageMediaDocument.
+             same chat containing the actual MessageMediaDocument —
+             this is the file card the user sees and can download
+             from directly in Telegram.
           3. If there are multiple results, additional pages may be
              reached via a "Next ➡️" style callback button.
 
-        IMPORTANT: this method does NOT click the file buttons (that
-        would make the bot transfer every candidate file just to
-        build a picker list). It only collects the (label, button)
-        pairs so the caller can show a numbered list. The actual
-        click — which triggers the bot to send the real file — only
-        happens later, in `_download_msg`, for the items the user
-        selects.
+        IMPORTANT: this method does NOT fetch/download the file
+        bytes (no `download_media`). It only clicks the button so
+        the bot posts the file card into the chat — the user then
+        downloads it themselves via the Telegram app/client.
 
-        Returns a flat list of (label_text, button) tuples.
+        Returns a flat list of (label_text, confirmed) tuples, where
+        `confirmed` is True if the bot's file message arrived after
+        the click, or False if it timed out.
         """
         file_buttons = []     # list of (label_text, button) — file results
         MAX_PAGES = 10
@@ -343,12 +345,47 @@ class EpisodeDownloader:
             file_buttons.extend(page_buttons)
             pages_seen += 1
 
-        if file_buttons:
-            log.info(f"  📋  Found {len(file_buttons)} file button(s) for this query")
+        if not file_buttons:
+            return []
 
-        return file_buttons
+        log.info(f"  📋  Found {len(file_buttons)} file button(s) for this query")
 
-    # ── Show results and let user pick ───────────────────────────
+        # ── Click each file button immediately (fresh) and confirm ──
+        results = []
+        for label, btn in file_buttons:
+            display_name, size = self._parse_label(label)
+
+            doc_event  = asyncio.Event()
+            doc_holder = [None]
+
+            @self.client.on(events.NewMessage(from_users=SEARCH_BOT))
+            async def doc_handler(event):
+                m = event.message
+                if m.media and isinstance(m.media, MessageMediaDocument):
+                    doc_holder[0] = m
+                    doc_event.set()
+
+            try:
+                await btn.click()
+                await asyncio.wait_for(doc_event.wait(), timeout=RESPONSE_TIMEOUT)
+                confirmed = doc_holder[0] is not None
+            except asyncio.TimeoutError:
+                confirmed = False
+            finally:
+                self.client.remove_event_handler(doc_handler)
+
+            if confirmed:
+                fname = self._filename_from_msg(doc_holder[0])
+                log.info(f"  ✓  Sent to chat: {fname}  ({size})")
+            else:
+                log.warning(f"  ⚠️  No file arrived for: {display_name}")
+
+            results.append((label, confirmed))
+            await asyncio.sleep(1)  # be polite between clicks
+
+        return results
+
+    # ── Label parsing / display helpers ───────────────────────────
 
     _LABEL_PATTERN = re.compile(
         r'^\[(?P<size>[^\]]+)\]\s*(?:\[(?P<tag>[^\]]+)\])?\s*(?P<name>.+)$'
@@ -375,7 +412,7 @@ class EpisodeDownloader:
         return name, size
 
     def _filename_from_msg(self, msg) -> str:
-        """Extract the best display name from a downloaded document message."""
+        """Extract the best display name from a confirmed document message."""
         if msg.media and isinstance(msg.media, MessageMediaDocument):
             for attr in msg.media.document.attributes:
                 if isinstance(attr, DocumentAttributeFilename):
@@ -385,16 +422,7 @@ class EpisodeDownloader:
             return f"[unnamed file — {size_mb:.0f} MB]"
         return "[unknown]"
 
-    def _filesize_from_msg(self, msg) -> str:
-        try:
-            size = msg.media.document.size
-            if size >= 1_073_741_824:
-                return f"{size/1_073_741_824:.2f} GB"
-            return f"{size/1_048_576:.0f} MB"
-        except Exception:
-            return "?"
-
-    async def select_and_download(
+    async def trigger_season(
         self,
         search_term : str,
         series      : str,
@@ -403,8 +431,11 @@ class EpisodeDownloader:
         to_ep,              # None = auto
     ):
         """
-        Browse mode: query episode by episode, show numbered results,
-        let user choose which to download.
+        For every episode in the requested range (or AUTO-detected
+        season length), search the bot and click every result button
+        found — so the bot posts each file card directly into this
+        chat. The user then downloads each file themselves via the
+        Telegram app/client; this method does not fetch any bytes.
         """
         auto  = to_ep is None
         limit = MAX_EPISODES_CAP if auto else (to_ep - from_ep + 1)
@@ -414,7 +445,8 @@ class EpisodeDownloader:
         print(f"  📅  Season {season}  ·  Episodes {from_ep} → {'AUTO' if auto else to_ep}")
         print(f"{'═'*58}\n")
 
-        all_results  = []   # (episode_number, query, label)
+        total_sent   = 0
+        total_misses = 0
         consec_fails = 0
 
         for ep in range(from_ep, from_ep + limit):
@@ -422,15 +454,22 @@ class EpisodeDownloader:
             query  = QUERY_TEMPLATE.format(
                 series=search_term, season=season, episode=ep
             )
-            print(f"  🔍  Searching {ep_str} …")
-            buttons = await self.browse_bot(query)
+            print(f"  🔍  {ep_str} …")
+            results = await self.browse_bot(query)
 
-            if buttons:
+            if results:
                 consec_fails = 0
-                for label, _btn in buttons:
-                    all_results.append((ep, query, label))
+                for label, confirmed in results:
+                    fname, fsize = self._parse_label(label)
+                    if confirmed:
+                        total_sent += 1
+                        print(f"  ✓  {ep_str}  →  {fname}  ({fsize})  — sent to chat")
+                    else:
+                        total_misses += 1
+                        print(f"  ⚠️  {ep_str}  →  {fname}  ({fsize})  — bot did not send the file")
             else:
                 consec_fails += 1
+                total_misses += 1
                 print(f"  ✗  Nothing found for {ep_str}")
                 if auto and consec_fails >= MAX_CONSECUTIVE_FAILS:
                     print(f"\n  🏁  {MAX_CONSECUTIVE_FAILS} consecutive misses — "
@@ -440,162 +479,15 @@ class EpisodeDownloader:
             if ep < from_ep + limit - 1:
                 await asyncio.sleep(DELAY_BETWEEN_EPISODES)
 
-        if not all_results:
-            print("\n  ❌  No results found at all. Check the series name / bot username.\n")
-            return
-
-        # ── Display the numbered list ──────────────────────────────
         print(f"\n{'─'*58}")
-        print(f"  📋  Found {len(all_results)} file(s):\n")
-        for i, (ep, _query, label) in enumerate(all_results, 1):
-            fname, fsize = self._parse_label(label)
-            ep_str = f"S{season:02d}E{ep:02d}"
-            print(f"  [{i:>2}]  {ep_str}  {fname}  ({fsize})")
-        print(f"{'─'*58}")
-
-        # ── Ask user which to download ─────────────────────────────
-        print()
-        print("  Enter numbers to download (e.g.  1 2 3  or  1-5  or  all):")
-        try:
-            choice = input("  > ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("\n  Cancelled.")
-            return
-
-        selected = self._parse_selection(choice, len(all_results))
-        if not selected:
-            print("  Nothing selected.")
-            return
-
-        # ── Download chosen files ──────────────────────────────────
-        # NOTE: the buttons collected during the search pass above can
-        # go stale by the time the user picks (the bot's results
-        # message may be deleted/expire after a few minutes — clicking
-        # an old button raises MessageIdInvalidError). So for each
-        # selected item we re-send its query to get a FRESH results
-        # message, then click immediately.
-        print(f"\n  ⬇  Downloading {len(selected)} file(s) …\n")
-        for idx in selected:
-            ep, query, label = all_results[idx - 1]
-            ep_str = f"S{season:02d}E{ep:02d}"
-            print(f"  🔄  {ep_str}  refreshing search before download …")
-            fresh_buttons = await self.browse_bot(query)
-            fresh_btn = self._match_button(fresh_buttons, label)
-            if fresh_btn is None:
-                print(f"  ⚠️  {ep_str}  couldn't re-find this result — skipping")
-                continue
-            await self._download_msg(fresh_btn, label, series, season, ep)
-            if idx != selected[-1]:
-                await asyncio.sleep(3)
-
-        print(f"\n  ✅  Done. Files saved to: {DOWNLOAD_DIR.resolve()}\n")
-
-    def _match_button(self, fresh_buttons, label: str):
-        """
-        Given a fresh list of (label, button) pairs from a re-search,
-        find the button matching `label` (the one shown to the user
-        in the numbered list).
-
-        Tries an exact match first, then falls back to matching on
-        the parsed display-name (in case sizes/whitespace shift
-        slightly between searches), then finally falls back to the
-        first available button if there's exactly one candidate.
-        """
-        if not fresh_buttons:
-            return None
-
-        for fresh_label, btn in fresh_buttons:
-            if fresh_label == label:
-                return btn
-
-        target_name, _ = self._parse_label(label)
-        for fresh_label, btn in fresh_buttons:
-            fresh_name, _ = self._parse_label(fresh_label)
-            if fresh_name == target_name:
-                return btn
-
-        if len(fresh_buttons) == 1:
-            return fresh_buttons[0][1]
-
-        return None
-
-    def _parse_selection(self, raw: str, max_n: int) -> list[int]:
-        """Parse '1 2 3', '1-5', 'all' into a sorted list of 1-based indices."""
-        raw = raw.strip().lower()
-        if raw in ("all", "a", "*"):
-            return list(range(1, max_n + 1))
-
-        indices = set()
-        # match ranges like 2-5 and plain numbers
-        for token in re.split(r"[\s,]+", raw):
-            range_m = re.match(r"^(\d+)-(\d+)$", token)
-            if range_m:
-                a, b = int(range_m.group(1)), int(range_m.group(2))
-                indices.update(range(a, b + 1))
-            elif token.isdigit():
-                indices.add(int(token))
-
-        valid = sorted(i for i in indices if 1 <= i <= max_n)
-        invalid = sorted(i for i in indices if not (1 <= i <= max_n))
-        if invalid:
-            print(f"  ⚠️  Ignored out-of-range: {invalid}")
-        return valid
-
-    async def _download_msg(self, btn, label: str, series: str, season: int, episode: int):
-        """
-        Click a result button, wait for the bot to send the actual
-        file as a follow-up message, then download it.
-
-        `btn` is the KeyboardButtonCallback whose .text is `label`
-        (e.g. "[1.40 GB] [S02E01] Psych 2006 American Duos 1080p WEB DL x265 MONOLITH").
-        """
-        ep_str = f"S{season:02d}E{episode:02d}"
-        display_name, _size = self._parse_label(label)
-
-        # ── Click the button, wait for the bot to send the document ──
-        doc_event  = asyncio.Event()
-        doc_holder = [None]
-
-        @self.client.on(events.NewMessage(from_users=SEARCH_BOT))
-        async def doc_handler(event):
-            m = event.message
-            if m.media and isinstance(m.media, MessageMediaDocument):
-                doc_holder[0] = m
-                doc_event.set()
-
-        try:
-            print(f"  ▶  {ep_str}  requesting: {display_name}")
-            await btn.click()
-            await asyncio.wait_for(doc_event.wait(), timeout=RESPONSE_TIMEOUT)
-        except asyncio.TimeoutError:
-            print(f"  ⏱  {ep_str}  timed out waiting for the bot to send the file")
-            return
-        finally:
-            self.client.remove_event_handler(doc_handler)
-
-        msg = doc_holder[0]
-        if msg is None:
-            print(f"  ⚠️  {ep_str}  bot did not send a file")
-            return
-
-        filename = self._filename_from_msg(msg)
-
-        safe_name = series.replace(" ", "_").replace("/", "-")
-        out_dir   = DOWNLOAD_DIR / safe_name / f"Season_{season:02d}"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path  = out_dir / filename
-
-        if out_path.exists():
-            print(f"  ⏭  {ep_str} already exists — skipping")
-            return
-
-        print(f"  ⬇  {ep_str}  →  {filename}")
-        await self.client.download_media(
-            msg,
-            file=str(out_path),
-            progress_callback=make_progress(filename),
-        )
-        print(f"  ✓  Saved: {out_path}")
+        if total_sent:
+            print(f"  ✅  {total_sent} file(s) sent to this chat — "
+                  f"open Telegram and download them there.")
+        if total_misses:
+            print(f"  ⚠️  {total_misses} episode(s)/result(s) had no file.")
+        if not total_sent and not total_misses:
+            print(f"  ❌  No results found at all. Check the series name / bot username.")
+        print(f"{'─'*58}\n")
 
 
 # ─── CLI ─────────────────────────────────────────────────────────
@@ -613,9 +505,9 @@ HELP = """
 ║                                                          ║
 ║  Flow:                                                   ║
 ║    1. Script searches the bot episode by episode         ║
-║    2. Shows you a numbered list of ALL results found     ║
-║    3. You pick which ones to download                    ║
-║    4. Downloads your selection in order                  ║
+║    2. Clicks every result so the bot sends each file     ║
+║       card directly into this chat                        ║
+║    3. You download each file yourself via Telegram       ║
 ║                                                          ║
 ║  Type  quit  to exit                                     ║
 ╚══════════════════════════════════════════════════════════╝
@@ -623,60 +515,49 @@ HELP = """
 
 async def run_cli(dl: EpisodeDownloader):
     print(HELP)
-    while True:
-        try:
-            raw = input("  Enter series (e.g. psych 2006 S02): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        if not raw:
-            continue
-        if raw.lower() in ("q", "quit", "exit"):
-            break
-
-        parsed = parse_input(raw)
-        if not parsed:
-            print(
-                "  ⚠️  Couldn't parse that.\n"
-                "      Try:  dark S02  or  psych 2006 S02  or  dark S02E01-08\n"
-            )
-            continue
-
+    try:
+        raw = input("  Enter series (e.g. psych 2006 S02): ").strip()
+    except (EOFError, KeyboardInterrupt):
         print()
-        print(f"  Series  : {parsed['search_term']}")
-        print(f"  Season  : {parsed['season']}")
-        if parsed["to_ep"] is None:
-            print(f"  Episodes: {parsed['from_ep']} → AUTO-DETECT")
-        elif parsed["from_ep"] == parsed["to_ep"]:
-            print(f"  Episode : {parsed['from_ep']} only")
-        else:
-            print(f"  Episodes: {parsed['from_ep']} → {parsed['to_ep']}")
-        print()
+        return
 
-        try:
-            confirm = input("  Search? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if confirm in ("n", "no"):
-            print()
-            continue
+    if not raw or raw.lower() in ("q", "quit", "exit"):
+        return
 
-        await dl.select_and_download(
-            search_term = parsed["search_term"],
-            series      = parsed["series"],
-            season      = parsed["season"],
-            from_ep     = parsed["from_ep"],
-            to_ep       = parsed["to_ep"],
+    parsed = parse_input(raw)
+    if not parsed:
+        print(
+            "  ⚠️  Couldn't parse that.\n"
+            "      Try:  dark S02  or  psych 2006 S02  or  dark S02E01-08\n"
         )
+        return
 
-        try:
-            again = input("  Search another? [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if again in ("n", "no"):
-            break
+    print()
+    print(f"  Series  : {parsed['search_term']}")
+    print(f"  Season  : {parsed['season']}")
+    if parsed["to_ep"] is None:
+        print(f"  Episodes: {parsed['from_ep']} → AUTO-DETECT")
+    elif parsed["from_ep"] == parsed["to_ep"]:
+        print(f"  Episode : {parsed['from_ep']} only")
+    else:
+        print(f"  Episodes: {parsed['from_ep']} → {parsed['to_ep']}")
+    print()
+
+    try:
+        confirm = input("  Search? [Y/n]: ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        return
+    if confirm in ("n", "no"):
         print()
+        return
+
+    await dl.trigger_season(
+        search_term = parsed["search_term"],
+        series      = parsed["series"],
+        season      = parsed["season"],
+        from_ep     = parsed["from_ep"],
+        to_ep       = parsed["to_ep"],
+    )
 
 
 # ─── Entry point ─────────────────────────────────────────────────
