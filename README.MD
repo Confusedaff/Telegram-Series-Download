@@ -4,7 +4,10 @@ A command-line tool built on [Telethon](https://docs.telethon.dev/) that automat
 
 > **How it actually works:** The script doesn't download video files to disk. It automates the *search and request* steps. The bot delivers each file as a Telegram message, and you download from there using the normal Telegram app.
 
----
+## Screenshots
+
+<!-- Replace with a screenshot of the help banner / startup output -->
+![Startup banner](<img width="1776" height="684" alt="Image" src="https://github.com/user-attachments/assets/a33b3410-4bf2-4643-8d4f-d8811a014761" />)
 
 ## Features
 
@@ -98,7 +101,10 @@ python episode_downloader.py
 
 On first run, Telethon will prompt for your phone number and login code, then save a session file (`ep_dl_session.session`) so future runs skip the login step.
 
-You'll see a help banner, then:
+<!-- Replace with a screenshot of the channel auto-join log output -->
+![Channel auto-join log](<img width="1794" height="64" alt="Image" src="https://github.com/user-attachments/assets/571fc5a5-06df-467e-ae2b-6302ef281cec" />)
+
+You'll then see a help banner followed by:
 
 ```
 Enter series (e.g. psych 2006 S02):
@@ -123,13 +129,17 @@ After parsing, the script confirms what it understood before searching:
   Search? [Y/n]:
 ```
 
+<!-- Replace with a screenshot of the input prompt and confirmation -->
+![Input prompt and confirmation](<img width="1312" height="266" alt="Image" src="https://github.com/user-attachments/assets/f1cc3a0a-c328-4e77-bee9-225fd059c0ac" />)
+
 Type `quit`, `q`, or `exit` at the first prompt to exit without searching.
 
 ---
 
 ## Where Files End Up
 
-For each matching result, the script clicks the bot's button — the bot then posts the file as a message in your Telegram chat with it. Open Telegram afterward and download each file from that chat as usual.
+<!-- Replace with a screenshot of the bot delivering files in Telegram -->
+![Bot delivering files in Telegram](<img width="1148" height="914" alt="Image" src="https://github.com/user-attachments/assets/143ab076-00c5-4d40-8c98-a1da26a2f9c9" />)
 
 ### Run Summary Example
 
@@ -140,7 +150,8 @@ For each matching result, the script clicks the bot's button — the bot then po
 ──────────────────────────────────────────────────────────
 ```
 
----
+<!-- Replace with a screenshot of the final summary in the terminal -->
+![Run summary](<img width="1410" height="210" alt="Image" src="https://github.com/user-attachments/assets/f67ac3b7-168b-466f-86bd-71f74188654d" />)
 
 ## Limitations & Notes
 
@@ -164,4 +175,4 @@ For each matching result, the script clicks the bot's button — the bot then po
 
 ## Disclaimer
 
-You are responsible for ensuring your use of this script — and of any bot you configure it to query — complies with [Telegram's Terms of Service](https://telegram.org/tos), the rules of that bot/channel, and applicable copyright law.
+You're responsible for ensuring your use of this script, and of any bot you configure it to query, complies with Telegram's Terms of Service, the rules of that bot/channel, and applicable copyright law.
