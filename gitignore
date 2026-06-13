@@ -1,0 +1,25 @@
+# ─── Secrets — NEVER upload these ───────────────────────
+.env
+
+# ─── Telethon session file (contains your login token) ───
+*.session
+*.session-journal
+
+# ─── Downloaded episodes ──────────────────────────────────
+downloads/
+
+# ─── Python cache ─────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# ─── Virtual environment ──────────────────────────────────
+venv/
+.venv/
+env/
+seriesbot/
+
+# ─── OS junk ──────────────────────────────────────────────
+.DS_Store
+Thumbs.db
